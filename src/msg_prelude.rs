@@ -11,7 +11,16 @@ where
     fn replace_user(&self, user: User) -> String {
         self.to_string().replace(
             "#User#",
-            &html::user_mention(user.id, user.full_name().as_str()),
+            &user_mention(&user)
         )
+    }
+}
+
+
+fn user_mention(user: &User) -> String {
+    if let Some(mention) = &user.mention() {
+        mention.to_owned()
+    } else {
+        html::user_mention(user.id, user.full_name().as_str())
     }
 }

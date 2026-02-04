@@ -18,4 +18,8 @@ pub enum Command {
     Leave,
     #[command(description = "查看发送消息者被谁注册")]
     WhoRegisteredMe,
+    #[command(description = "将自己加入 Call 黑名单")]
+    Blacklist,
+    #[command(description = "将自己从 Call 黑名单移除")]
+    Unblacklist,
 }

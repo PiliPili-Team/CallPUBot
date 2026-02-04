@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
-use anyhow::Ok;
 use sysinfo::System;
+use teloxide::dispatching::dialogue::GetChatId;
 use teloxide::{
     dispatching::UpdateFilterExt,
     payloads,
@@ -10,13 +10,10 @@ use teloxide::{
     types::{Me, Message, MessageId, Recipient, User},
     utils::command::BotCommands,
 };
-use teloxide::{dispatching::dialogue::GetChatId, utils::html};
 use tokio::sync::Mutex;
 
 use crate::{
-    CallResult, LeaveResult, ReplaceUserExt, UserRegister,
-    call_map::CallMap,
-    cmd::{self, Command},
+    BlacklistResult, CallResult, LeaveResult, ReplaceUserExt, UnblacklistResult, UserRegister, call_map::CallMap, cmd::{self, Command}, question::{QUESTION_HINT, QUESTION_MAP}
 };
 
 pub struct Bot(Arc<Mutex<BotInner>>);
@@ -70,6 +67,10 @@ trait SendMessageExt {
     async fn remove_later_30s(
         self, inner: &BotInner, from_msg: MessageId,
     ) -> anyhow::Result<Message>;
+
+    async fn remove_later_30s_with_timeout_hint(
+        self, inner: &BotInner, from_msg: Message,
+    ) -> anyhow::Result<Message>;
 }
 
 impl SendMessageExt for SendMessage {
@@ -89,6 +90,43 @@ impl SendMessageExt for SendMessage {
                 .delete_messages(recipient, vec![msg_id, from_msg_id])
                 .send()
                 .await;
+        });
+
+        Ok(sent)
+    }
+
+    async fn remove_later_30s_with_timeout_hint(
+        self, inner: &BotInner, from_msg: Message,
+    ) -> anyhow::Result<Message> {
+        let bot = inner.bot.clone();
+
+        let sent = self.send().await?;
+
+        let recipient: Recipient = sent.chat.id.into();
+        let msg_id = sent.id;
+        let from_msg_id = from_msg.id;
+        let Some(from_usr) = from_msg.from else {
+            return Ok(sent);
+        };
+
+        tokio::spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let _ = bot
+                .delete_messages(recipient.clone(), vec![msg_id, from_msg_id])
+                .send()
+                .await;
+            let Ok(r) = bot
+                .send_message(
+                    recipient.clone(),
+                    "#User# 验证超时了捏".replace_user(from_usr),
+                )
+                .send()
+                .await
+            else {
+                return;
+            };
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let _ = bot.delete_message(r.chat.id, r.id).send().await;
         });
 
         Ok(sent)
@@ -151,7 +189,14 @@ impl BotInner {
             Some("r") | Some("R") => self.register_user(msg).await?,
             Some("l") | Some("L") | Some("丨") => self.leave_user(msg).await?,
             Some("c") | Some("C") => self.call_pu(msg).await?,
-            _ => {}
+            Some("true") | Some("True") | Some("TRUE") | Some("t") | Some("y") => {
+                self.answer_captcha(&msg, true).await?
+            }
+            Some("false") | Some("False") | Some("FALSE") | Some("f") | Some("n") => {
+                self.answer_captcha(&msg, false).await?
+            }
+
+            _ => (),
         }
         Ok(())
     }
@@ -163,7 +208,151 @@ impl BotInner {
             Command::Register => self.register_user(msg).await,
             Command::Leave => self.leave_user(msg).await,
             Command::WhoRegisteredMe => self.who_registered_me(msg).await,
+            Command::Blacklist => self.captcha_blacklist_user(msg).await,
+            Command::Unblacklist => self.unblacklist_user(msg).await,
         }
+    }
+
+    async fn blacklist_user(&mut self, msg: Message) -> anyhow::Result<()> {
+        let chat_id = msg.chat.id;
+        let Some(ref from_user) = msg.from else {
+            return Ok(());
+        };
+
+        if let BlacklistResult::AlreadyBlacklisted = self.callmap.blacklist(chat_id, from_user.id) {
+            self.send_message(
+                msg.chat.id,
+                "#User# 你已经在 Call 黑名单里了捏".replace_user(from_user.clone()),
+            )
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .remove_later_30s(self, msg.id)
+            .await?;
+            return Ok(());
+        }
+
+        self.send_message(
+            msg.chat.id,
+            "#User# 已加入 Call 黑名单".replace_user(from_user.clone()),
+        )
+        .parse_mode(teloxide::types::ParseMode::Html)
+        .remove_later_30s(self, msg.id)
+        .await?;
+
+        if self.callmap.has_user(&chat_id, from_user) {
+            self.leave_user(msg).await?;
+        }
+
+        Ok(())
+    }
+
+    async fn captcha_blacklist_user(&mut self, msg: Message) -> anyhow::Result<()> {
+        let Some(ref from_user) = msg.from else {
+            return Ok(());
+        };
+        
+        if self.callmap.has_captcha(&msg.chat.id, &from_user.id) {
+            self.send_message(
+                msg.chat.id,
+                "#User# 你已经有一个未完成的人机验证了捏".replace_user(msg.from.as_ref().unwrap().clone()),
+            )
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .remove_later_30s(self, msg.id)
+            .await?;
+            return Ok(());
+        }
+        
+        let need_captcha = rand::random::<u32>() % 10 < 3;
+        if need_captcha {
+            self.captcha_user(&msg).await?;
+            return Ok(());
+        }
+
+        self.blacklist_user(msg).await?;
+
+        Ok(())
+    }
+
+    async fn captcha_user(&mut self, msg: &Message) -> anyhow::Result<()> {
+        let Some(ref from_user) = msg.from else {
+            return Ok(());
+        };
+
+        let captcha_msg = QUESTION_HINT.replace_user(from_user.clone());
+        let Some(captcha_question) = QUESTION_MAP
+            .get(rand::random::<u64>() as usize % QUESTION_MAP.len())
+        else {
+            return Ok(());
+        };
+
+        self.callmap
+            .push_captcha(msg.chat.id, from_user.id, captcha_question.1);
+
+        self.send_message(
+            msg.chat.id,
+            format!(
+                "{}\n{}",
+                captcha_msg,
+                teloxide::utils::html::code_block_with_lang(captcha_question.0, "Rust")
+            ),
+        )
+        .parse_mode(teloxide::types::ParseMode::Html)
+        .remove_later_30s_with_timeout_hint(self, msg.clone())
+        .await?;
+
+        Ok(())
+    }
+
+    async fn answer_captcha(&mut self, msg: &Message, ans: bool) -> anyhow::Result<()> {
+        let Some(ref from_user) = msg.from else {
+            return Ok(());
+        };
+
+        let Some(expected_answer) = self.callmap.pop_captcha(msg.chat.id, &from_user.id) else {
+            return Ok(());
+        };
+
+        if ans != expected_answer {
+            self.send_message(
+                msg.chat.id,
+                "#User# 人机验证失败，未加入 Call 黑名单".replace_user(from_user.clone()),
+            )
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .remove_later_30s(self, msg.id)
+            .await?;
+            return Ok(());
+        }
+
+        self.blacklist_user(msg.clone()).await?;
+
+        Ok(())
+    }
+
+    async fn unblacklist_user(&mut self, msg: Message) -> anyhow::Result<()> {
+        let chat_id = msg.chat.id;
+        let Some(from_user) = msg.from else {
+            return Ok(());
+        };
+
+        if let UnblacklistResult::NotInBlacklist = self.callmap.unblacklist(chat_id, from_user.id) {
+            self.send_message(
+                msg.chat.id,
+                "#User# 你不在 Call 黑名单里捏".replace_user(from_user),
+            )
+            .parse_mode(teloxide::types::ParseMode::Html)
+            .remove_later_30s(self, msg.id)
+            .await?;
+            return Ok(());
+        }
+
+        self.send_message(
+            msg.chat.id,
+            "#User# 已从 Call 黑名单移除".replace_user(from_user),
+        )
+        .parse_mode(teloxide::types::ParseMode::Html)
+        .remove_later_30s(self, msg.id)
+        .await?;
+
+        Ok(())
     }
 
     async fn who_registered_me(&mut self, msg: Message) -> anyhow::Result<()> {
@@ -183,7 +372,7 @@ impl BotInner {
             return Ok(());
         }
 
-        if let Some(registered_by) = self.callmap.get_register(from_user) {
+        if let Some(registered_by) = self.callmap.get_register(&chat_id ,from_user) {
             self.send_message(
                 msg.chat.id,
                 "查到了！#User# 注册了你捏".replace_user(registered_by.clone()),
@@ -229,7 +418,7 @@ impl BotInner {
                 if from_user.id == user.id {
                     None
                 } else {
-                    Some(html::user_mention(user.id, user.full_name().as_str()))
+                    Some("#User#".replace_user(user.clone())).to_owned()
                 }
             })
             .collect::<Vec<_>>();
@@ -245,7 +434,6 @@ impl BotInner {
 
         self.send_message(msg.chat.id, format!("正在 Call PU：\n{}\n\n温馨提示：\n使用 /whoregisteredme 可以查看是谁把您拉进来的捏", mention_msg))
             .parse_mode(teloxide::types::ParseMode::Html)
-            .remove_later_30s(self, msg.id)
             .await?;
         Ok(())
     }
@@ -257,9 +445,9 @@ impl BotInner {
             return Ok(());
         };
 
-        if let Some(reply_to) = msg.reply_to_message() {
-            if let Some(user) = &reply_to.from {
-                let anonymous = (rand::random::<u32>() % 10) == 0;
+        if let Some(reply_to) = msg.reply_to_message()
+            && let Some(user) = &reply_to.from {
+                let anonymous = rand::random::<u32>().is_multiple_of(10);
 
                 let user_register = if anonymous {
                     UserRegister {
@@ -288,10 +476,18 @@ impl BotInner {
                         .remove_later_30s(self, msg.id)
                         .await?
                     }
+                    CallResult::InBlacklist => {
+                        self.send_message(
+                            msg.chat.id,
+                            "#User# 在黑名单中，无法注册捏".replace_user(user.clone()),
+                        )
+                        .parse_mode(teloxide::types::ParseMode::Html)
+                        .remove_later_30s(self, msg.id)
+                        .await?
+                    }
                 };
                 return Ok(());
             }
-        }
 
         let from = UserRegister {
             register: Some(from.clone()),
@@ -308,6 +504,15 @@ impl BotInner {
                 self.send_message(
                     msg.chat.id,
                     "注册成功！#User# 现在会被 Call 了".replace_user(from.user),
+                )
+                .parse_mode(teloxide::types::ParseMode::Html)
+                .remove_later_30s(self, msg.id)
+                .await?
+            }
+            CallResult::InBlacklist => {
+                self.send_message(
+                    msg.chat.id,
+                    "#User# 在黑名单中，你要不先使用 /unblacklist 退一下？".replace_user(from.user),
                 )
                 .parse_mode(teloxide::types::ParseMode::Html)
                 .remove_later_30s(self, msg.id)

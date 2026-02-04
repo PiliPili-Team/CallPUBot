@@ -4,6 +4,7 @@ use tracing_subscriber::fmt::time::ChronoLocal;
 mod bot;
 mod call_map;
 mod cmd;
+mod question;
 mod msg_prelude;
 
 pub use call_map::*;
